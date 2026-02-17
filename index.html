@@ -182,7 +182,12 @@
         };
 
         const app = initializeApp(firebaseConfig);
-        const analytics = getAnalytics(app);
+        let analytics = null;
+        try {
+            analytics = getAnalytics(app);
+        } catch (e) {
+            console.warn("Analytics Error:", e);
+        }
         const auth = getAuth(app);
         const db = getFirestore(app);
         const appId = typeof __app_id !== 'undefined' ? __app_id : 'akad-syirkah-pro-v1';
@@ -196,7 +201,9 @@
             sessionId: null,
             user: null,
             syncStatus: 'offline',
-            syncError: null
+            syncError: null,
+            lastUpdatedClient: 0,
+            localDirty: false
         };
 
         let autoSaveTimeout = null;
@@ -207,13 +214,42 @@
             const container = document.getElementById('sync-status');
             container.classList.remove('hidden');
             let icon = 'cloud-off', text = 'Offline', color = 'text-gray-400';
+            const errorHint = (state.syncError || '').toLowerCase();
             
             if (state.syncStatus === 'syncing') { icon = 'refresh-cw'; text = 'Menyimpan...'; color = 'text-emerald-200 animate-pulse'; }
             else if (state.syncStatus === 'saved') { icon = 'cloud'; text = 'Tersimpan'; color = 'text-emerald-300'; }
-            else if (state.syncStatus === 'error') { icon = 'alert-circle'; text = 'Error Sync'; color = 'text-red-300'; }
+            else if (state.syncStatus === 'error') {
+                icon = 'alert-circle';
+                if (errorHint.includes('permission')) text = 'Akses DB Ditolak';
+                else if (errorHint.includes('auth')) text = 'Auth Gagal';
+                else text = 'Error Sync';
+                color = 'text-red-300';
+            }
             
-            container.innerHTML = `<span class="text-xs ${color} flex items-center gap-1" title="${state.syncError || ''}"><i data-lucide="${icon}" class="w-3 h-3 ${state.syncStatus === 'syncing' ? 'loading-spinner' : ''}"></i> ${text}</span>`;
+            const retryBtn = state.syncStatus === 'error'
+                ? `<button onclick="retrySync()" class="ml-2 text-[10px] bg-white/20 hover:bg-white/30 px-2 py-0.5 rounded">Coba Lagi</button>`
+                : '';
+            container.innerHTML = `<span class="text-xs ${color} flex items-center gap-1" title="${state.syncError || ''}"><i data-lucide="${icon}" class="w-3 h-3 ${state.syncStatus === 'syncing' ? 'loading-spinner' : ''}"></i> ${text}</span>${retryBtn}`;
             lucide.createIcons();
+        };
+
+        window.retrySync = async () => {
+            state.syncStatus = 'syncing';
+            updateSyncUI();
+            try {
+                if (!auth.currentUser) {
+                    await signInAnonymously(auth);
+                }
+                if (auth.currentUser) {
+                    startSync(auth.currentUser.uid);
+                }
+                debouncedSave();
+            } catch (e) {
+                console.error("Retry Sync Error:", e);
+                state.syncStatus = 'error';
+                state.syncError = e?.message || 'Retry failed';
+                updateSyncUI();
+            }
         };
 
         const debouncedSave = () => {
@@ -223,14 +259,18 @@
             autoSaveTimeout = setTimeout(async () => {
                 if (!auth.currentUser || !state.sessionId) return;
                 try {
+                    const clientUpdatedAt = Date.now();
                     const docRef = doc(db, 'akad_sessions', state.sessionId);
                     await setDoc(docRef, {
                         generalData: state.generalData,
                         members: state.members,
+                        lastUpdatedClient: clientUpdatedAt,
                         lastUpdated: serverTimestamp()
                     }, { merge: true });
                     state.syncStatus = 'saved';
                     state.syncError = null;
+                    state.lastUpdatedClient = clientUpdatedAt;
+                    state.localDirty = false;
                 } catch (e) {
                     console.error("Firestore Save Error:", e);
                     state.syncStatus = 'error';
@@ -345,6 +385,7 @@
             const member = state.members.find(m => m.id === id);
             if (member) {
                 member[field] = (field === 'share') ? parseFloat(value) || 0 : value;
+                state.localDirty = true;
                 renderPreview();
                 debouncedSave();
             }
@@ -404,9 +445,30 @@
                 const y = (e.touches ? e.touches[0].clientY : e.clientY) - rect.top;
                 return { x: x * (canvas.width / rect.width), y: y * (canvas.height / rect.height) };
             };
-            canvas.onmousedown = canvas.ontouchstart = (e) => { drawing = true; const p = getPos(e); ctx.beginPath(); ctx.moveTo(p.x, p.y); };
-            canvas.onmousemove = canvas.ontouchmove = (e) => { if (!drawing) return; const p = getPos(e); ctx.lineTo(p.x, p.y); ctx.stroke(); e.preventDefault(); };
-            window.onmouseup = canvas.ontouchend = () => { if (drawing) { drawing = false; updateMemberState(member.id, 'signature', canvas.toDataURL()); } };
+            const startDraw = (e) => {
+                drawing = true;
+                const p = getPos(e);
+                ctx.beginPath();
+                ctx.moveTo(p.x, p.y);
+                if (e.pointerId !== undefined) canvas.setPointerCapture(e.pointerId);
+            };
+            const moveDraw = (e) => {
+                if (!drawing) return;
+                const p = getPos(e);
+                ctx.lineTo(p.x, p.y);
+                ctx.stroke();
+                if (e.cancelable) e.preventDefault();
+            };
+            const endDraw = () => {
+                if (!drawing) return;
+                drawing = false;
+                updateMemberState(member.id, 'signature', canvas.toDataURL());
+            };
+            canvas.onpointerdown = startDraw;
+            canvas.onpointermove = moveDraw;
+            canvas.onpointerup = endDraw;
+            canvas.onpointercancel = endDraw;
+            canvas.onpointerleave = endDraw;
         };
 
         window.clearSig = (id) => {
@@ -472,6 +534,13 @@
             onSnapshot(docRef, (snap) => {
                 if (snap.exists()) {
                     const data = snap.data();
+                    const remoteUpdatedAt = data.lastUpdatedClient || 0;
+                    if (state.localDirty && remoteUpdatedAt < state.lastUpdatedClient) {
+                        state.syncStatus = 'saved';
+                        state.syncError = null;
+                        updateSyncUI();
+                        return;
+                    }
                     
                     state.generalData = data.generalData || state.generalData;
                     
@@ -485,6 +554,7 @@
                     
                     state.syncStatus = 'saved';
                     state.syncError = null;
+                    state.lastUpdatedClient = remoteUpdatedAt;
                 } else {
                     debouncedSave();
                 }
@@ -534,8 +604,8 @@
 
             await initAuth();
 
-            document.getElementById('input-start-date').onchange = (e) => { state.generalData.startDate = e.target.value; renderPreview(); debouncedSave(); };
-            document.getElementById('input-frequency').onchange = (e) => { state.generalData.frequency = e.target.value; renderPreview(); debouncedSave(); };
+            document.getElementById('input-start-date').onchange = (e) => { state.generalData.startDate = e.target.value; state.localDirty = true; renderPreview(); debouncedSave(); };
+            document.getElementById('input-frequency').onchange = (e) => { state.generalData.frequency = e.target.value; state.localDirty = true; renderPreview(); debouncedSave(); };
 
             renderMembers();
             updateSyncUI();
